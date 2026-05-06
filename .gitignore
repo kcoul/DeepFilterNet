@@ -8,6 +8,23 @@ out/
 export/
 assets/valid_cache*
 DeepFilterNet/poetry.lock
+
+# Pre-trained model checkpoints — download separately, not committed
+_export_model/
+
+# Generated ONNX exports and reference tensors — build artifacts
+onnx_export/
+out_spec/
+out_spec_static/
+out_spec_trace/
+
+# Codex-generated scratch files
+flow.svg
+
+# ONNX and reference tensor files placed in onnx_test/ by the C test pipeline.
+# The directory structure (with .gitkeep placeholders) is committed; the files are not.
+onnx_test/**/*.onnx
+onnx_test/**/*.npz
 .vscode
 
 ### Rust gitignore ###
