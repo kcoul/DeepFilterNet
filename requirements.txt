@@ -1,0 +1,26 @@
+# Python dependencies for DeepFilterNet export and validation tooling.
+#
+# Install order:
+#   1. pip install -r requirements.txt
+#   2. maturin develop --release --manifest-path pyDF/Cargo.toml
+#   3. pip install -e DeepFilterNet --no-deps --no-build-isolation
+
+# Neural network framework — torch 2.11 required for torchaudio compatibility
+torch==2.11.0
+torchaudio==2.11.0
+
+# ONNX export and validation
+onnx==1.21.0
+onnxruntime==1.23.2
+
+# Logging used by export scripts
+loguru==0.7.3
+
+# Numerical reference data
+numpy==2.4.4
+
+# Build tooling for the libdf Rust extension (pyDF/Cargo.toml)
+maturin==1.13.1
+
+# Required by 'pip install -e DeepFilterNet --no-build-isolation'
+poetry-core==2.4.0
