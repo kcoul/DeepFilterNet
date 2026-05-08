@@ -5,13 +5,15 @@
 #   2. maturin develop --release --manifest-path pyDF/Cargo.toml
 #   3. pip install -e DeepFilterNet --no-deps --no-build-isolation
 
-# Neural network framework — torch 2.11 required for torchaudio compatibility
-torch==2.11.0
-torchaudio==2.11.0
+# Neural network framework — torch 2.11 required for torchaudio compatibility.
+# Use the PyTorch CPU wheel channel so Linux installs do not pull CUDA runtime packages.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.11.0+cpu
+torchaudio==2.11.0+cpu
 
 # ONNX export and validation
 onnx==1.21.0
-onnxruntime==1.23.2
+onnxruntime==1.25.1
 
 # Logging used by export scripts
 loguru==0.7.3
