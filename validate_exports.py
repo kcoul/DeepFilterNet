@@ -17,7 +17,7 @@ import onnxruntime as ort
 import torch
 
 from df.enhance import df_features, init_df
-from df.scripts.export import ModelParams, SpectralEnhancer
+from df.scripts.export import ModelParams, SpectralEnhancer, StreamingSpectralEnhancer
 from df.utils import get_norm_alpha
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "_export_model", "DeepFilterNet3")
@@ -26,6 +26,7 @@ ORIGINAL_WAV_MODEL = os.path.join(os.path.dirname(__file__), "onnx_test", "origi
 
 WAVEFORM_FRAME = 480
 WAVEFORM_STATE = 45304
+# State size breakdown: 128 feat-norm + 704 enc + 512 erb_dec + 512 df_dec + 4810 df-ring(5×481×2)
 SPEC_STATE = 6666
 ENC_STATE = 704
 DEC_STATE = 512
@@ -63,8 +64,8 @@ def _run_waveform_stream(sess, audio_np):
     return np.concatenate(outs, axis=0)[np.newaxis, :]
 
 
-def _run_spectral_stream(sess, spec_np):
-    state = np.zeros((SPEC_STATE,), dtype=np.float32)
+def _run_spectral_stream(sess, spec_np, initial_state):
+    state = initial_state.copy()
     enh_frames = []
     lsnr_frames = []
     for idx in range(spec_np.shape[2]):
@@ -137,8 +138,28 @@ model = model.to("cpu").eval()
 print(f"  Epoch {epoch}")
 
 p = ModelParams()
-audio_np = np.load(os.path.join(EXPORT_DIR, "wav_input.npz"))["audio"].astype(np.float32)
-audio_t = torch.from_numpy(audio_np)
+
+# Build the streaming spectral wrapper to get the correct non-zero initial state.
+# (ERB norm init = linspace(-60,-90), spec norm init = unit_norm_init — not zeros.)
+with torch.no_grad():
+    _spec_wrapper = StreamingSpectralEnhancer(
+        model, df_state.erb_widths(), p.sr, p.nb_df, get_norm_alpha(log=False)
+    ).to("cpu")
+    spec_initial_state = _spec_wrapper.initial_state().numpy()
+
+# Load reference audio — only required for the waveform check ([1] below).
+# Spectral and component checks synthesise their own reference from the model.
+wav_npz = os.path.join(EXPORT_DIR, "wav_input.npz")
+if os.path.exists(wav_npz):
+    audio_np = np.load(wav_npz)["audio"].astype(np.float32)
+    audio_t = torch.from_numpy(audio_np)
+    have_wav = True
+else:
+    print("  wav_input.npz not found — skipping waveform check (re-export with --export-waveform).")
+    audio_t = torch.randn(1, p.sr)
+    audio_np = None
+    have_wav = False
+
 spec_t, feat_erb_t, feat_spec_t = df_features(audio_t, df_state, p.nb_df, device="cpu")
 feat_spec_ch_t = feat_spec_t.transpose(1, 4).squeeze(4)
 
@@ -163,15 +184,19 @@ feat_erb_np = feat_erb_t.numpy().astype(np.float32)
 feat_spec_ch_np = feat_spec_ch_t.numpy().astype(np.float32)
 
 print("\n[1] Waveform streaming export")
-wav_export = _sess(os.path.join(EXPORT_DIR, "deepfilternet_v3.onnx"))
-wav_original = _sess(ORIGINAL_WAV_MODEL)
-export_audio = _run_waveform_stream(wav_export, audio_np)
-original_audio = _run_waveform_stream(wav_original, audio_np)
-ok1 = _stats("exported waveform vs original waveform model", export_audio, original_audio, 1e-6, 1e-6)
+if have_wav:
+    wav_export = _sess(os.path.join(EXPORT_DIR, "deepfilternet_v3.onnx"))
+    wav_original = _sess(ORIGINAL_WAV_MODEL)
+    export_audio = _run_waveform_stream(wav_export, audio_np)
+    original_audio = _run_waveform_stream(wav_original, audio_np)
+    ok1 = _stats("exported waveform vs original waveform model", export_audio, original_audio, 1e-6, 1e-6)
+else:
+    print("  SKIP")
+    ok1 = True
 
 print("\n[2] Spectral streaming export")
 spec_export = _sess(os.path.join(EXPORT_DIR, "deepfilternet_spec.onnx"))
-ort_spec, final_spec_state, ort_lsnr = _run_spectral_stream(spec_export, spec_np)
+ort_spec, final_spec_state, ort_lsnr = _run_spectral_stream(spec_export, spec_np, spec_initial_state)
 ok2 = _stats(
     "streaming spectral ONNX vs batch spectral Torch",
     ort_spec,
