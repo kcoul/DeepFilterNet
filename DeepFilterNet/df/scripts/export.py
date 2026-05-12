@@ -1,9 +1,10 @@
+import math
 import os
 import shutil
 import tarfile
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import onnx
@@ -26,7 +27,7 @@ from df.enhance import (
 from df.io import get_test_sample, save_audio
 from df.modules import DfOp, ExponentialUnitNorm, erb_fb
 from df.utils import get_norm_alpha
-from libdf import DF
+from libdf import DF, unit_norm_init
 
 
 def shapes_dict(
@@ -45,6 +46,24 @@ def ensure_tuple(x):
     if isinstance(x, list):
         return tuple(x)
     return (x,)
+
+
+def _numel(shape: Iterable[int]) -> int:
+    return math.prod(int(v) for v in shape)
+
+
+def _flatten_parts(parts: Iterable[Tensor]) -> Tensor:
+    return torch.cat([p.reshape(-1) for p in parts], dim=0)
+
+
+def _unflatten_state(state: Tensor, shapes: Iterable[Tuple[int, ...]]) -> List[Tensor]:
+    parts: List[Tensor] = []
+    offset = 0
+    for shape in shapes:
+        n = _numel(shape)
+        parts.append(state[offset : offset + n].view(shape))
+        offset += n
+    return parts
 
 
 class ExponentialMeanNorm(nn.Module):
@@ -85,6 +104,48 @@ class SpectralFeatures(nn.Module):
         erb_feat = self.erb_norm(erb_feat)
         spec_feat = self.spec_norm(spec[..., : self.nb_df, :])
         return erb_feat, spec_feat
+
+
+class StreamingSpectralFeatures(nn.Module):
+    def __init__(self, erb_fb_widths: np.ndarray, sr: int, nb_df: int, alpha: float):
+        super().__init__()
+        fb = erb_fb(erb_fb_widths, sr, inverse=False).to("cpu")
+        self.nb_df = nb_df
+        self.alpha = alpha
+        self.register_buffer("erb_fb", fb)
+        self.register_buffer(
+            "erb_norm_init_state",
+            torch.linspace(-60.0, -90.0, fb.shape[1], dtype=torch.float32).view(1, 1, -1),
+        )
+        self.register_buffer(
+            "spec_norm_init_state",
+            torch.from_numpy(unit_norm_init(nb_df)).float().view(1, 1, nb_df, 1),
+        )
+
+    def initial_state(self) -> Tensor:
+        return _flatten_parts((self.erb_norm_init_state, self.spec_norm_init_state))
+
+    @property
+    def state_shapes(self) -> List[Tuple[int, ...]]:
+        return [
+            tuple(self.erb_norm_init_state.shape),
+            tuple(self.spec_norm_init_state.shape),
+        ]
+
+    def forward(self, spec: Tensor, erb_state: Tensor, spec_state: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        power_spec = spec.square().sum(dim=-1)
+        erb_raw = torch.matmul(power_spec, self.erb_fb).clamp_min(1e-10).log10() * 10.0
+        erb_cur = erb_raw[:, :, 0, :]
+        new_erb_state = erb_cur * (1 - self.alpha) + erb_state * self.alpha
+        feat_erb = ((erb_cur - new_erb_state) / 40.0).unsqueeze(2)
+
+        spec_cur = spec[:, :, 0, : self.nb_df, :]
+        spec_abs = spec_cur.square().sum(dim=-1, keepdim=True).clamp_min(1e-14).sqrt()
+        new_spec_state = spec_abs * (1 - self.alpha) + spec_state * self.alpha
+        feat_spec = spec_cur / new_spec_state.sqrt()
+        feat_spec = feat_spec.permute(0, 3, 1, 2)
+
+        return feat_erb, feat_spec, new_erb_state, new_spec_state
 
 
 class DfOutputReshapeOld(nn.Module):
@@ -159,6 +220,209 @@ class SpectralEnhancer(nn.Module):
         feat_erb, feat_spec = self.features(spec)
         enh = self.model(spec, feat_erb, feat_spec)
         return (enh,)
+
+
+class StreamingEncoder(nn.Module):
+    def __init__(self, encoder: nn.Module):
+        super().__init__()
+        p = ModelParams()
+        self.encoder = encoder
+        self.prev_erb_frames = 2
+        self.prev_spec_frames = 2
+        self.feat_erb_bins = encoder.erb_bins
+        self.feat_spec_bins = p.nb_df
+        self.emb_hidden_size = encoder.emb_gru.hidden_size
+        self.emb_num_layers = encoder.emb_gru.gru.num_layers
+
+    @property
+    def state_shapes(self) -> List[Tuple[int, ...]]:
+        return [
+            (1, 1, self.prev_erb_frames, self.feat_erb_bins),
+            (1, 2, self.prev_spec_frames, self.feat_spec_bins),
+            (self.emb_num_layers, 1, self.emb_hidden_size),
+        ]
+
+    def initial_state(self) -> Tensor:
+        return _flatten_parts([torch.zeros(shape, dtype=torch.float32) for shape in self.state_shapes])
+
+    def forward(
+        self, feat_erb: Tensor, feat_spec: Tensor, state: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        prev_erb, prev_spec, h = _unflatten_state(state, self.state_shapes)
+
+        feat_erb_seq = torch.cat((prev_erb, feat_erb), dim=2)
+        feat_spec_seq = torch.cat((prev_spec, feat_spec), dim=2)
+
+        e0 = self.encoder.erb_conv0(feat_erb_seq)
+        e1 = self.encoder.erb_conv1(e0)
+        e2 = self.encoder.erb_conv2(e1)
+        e3 = self.encoder.erb_conv3(e2)
+        c0 = self.encoder.df_conv0(feat_spec_seq)
+        c1 = self.encoder.df_conv1(c0)
+        cemb = c1[:, :, -1:, :].permute(0, 2, 3, 1).flatten(2)
+        cemb = self.encoder.df_fc_emb(cemb)
+        emb = e3[:, :, -1:, :].permute(0, 2, 3, 1).flatten(2)
+        emb = self.encoder.combine(emb, cemb)
+        emb, h = self.encoder.emb_gru(emb, h)
+        lsnr = self.encoder.lsnr_fc(emb) * self.encoder.lsnr_scale + self.encoder.lsnr_offset
+
+        new_state = _flatten_parts((feat_erb_seq[:, :, 1:, :], feat_spec_seq[:, :, 1:, :], h))
+        return (
+            e0[:, :, -1:, :],
+            e1[:, :, -1:, :],
+            e2[:, :, -1:, :],
+            e3[:, :, -1:, :],
+            emb[:, -1:, :],
+            c0[:, :, -1:, :],
+            lsnr[:, -1:, :],
+            new_state,
+        )
+
+
+class StreamingErbDecoder(nn.Module):
+    def __init__(self, decoder: nn.Module):
+        super().__init__()
+        self.decoder = decoder
+        self.hidden_size = decoder.emb_gru.hidden_size
+        self.num_layers = decoder.emb_gru.gru.num_layers
+
+    @property
+    def state_shapes(self) -> List[Tuple[int, ...]]:
+        return [(self.num_layers, 1, self.hidden_size)]
+
+    def initial_state(self) -> Tensor:
+        return _flatten_parts([torch.zeros(shape, dtype=torch.float32) for shape in self.state_shapes])
+
+    def forward(self, emb: Tensor, e3: Tensor, e2: Tensor, e1: Tensor, e0: Tensor, state: Tensor) -> Tuple[Tensor, Tensor]:
+        (h,) = _unflatten_state(state, self.state_shapes)
+        b, _, t, f8 = e3.shape
+        emb, h = self.decoder.emb_gru(emb, h)
+        emb = emb.view(b, t, f8, -1).permute(0, 3, 1, 2)
+        e3 = self.decoder.convt3(self.decoder.conv3p(e3) + emb)
+        e2 = self.decoder.convt2(self.decoder.conv2p(e2) + e3)
+        e1 = self.decoder.convt1(self.decoder.conv1p(e1) + e2)
+        m = self.decoder.conv0_out(self.decoder.conv0p(e0) + e1)
+        return m, _flatten_parts((h,))
+
+
+class StreamingDfDecoder(nn.Module):
+    def __init__(self, decoder: nn.Module):
+        super().__init__()
+        self.decoder = decoder
+        self.hidden_size = decoder.df_gru.hidden_size
+        self.num_layers = decoder.df_gru.gru.num_layers
+
+    @property
+    def state_shapes(self) -> List[Tuple[int, ...]]:
+        return [(self.num_layers, 1, self.hidden_size)]
+
+    def initial_state(self) -> Tensor:
+        return _flatten_parts([torch.zeros(shape, dtype=torch.float32) for shape in self.state_shapes])
+
+    def forward(self, emb: Tensor, c0: Tensor, state: Tensor) -> Tuple[Tensor, Tensor]:
+        (h,) = _unflatten_state(state, self.state_shapes)
+        b, t, _ = emb.shape
+        c, h = self.decoder.df_gru(emb, h)
+        if self.decoder.df_skip is not None:
+            c = c + self.decoder.df_skip(emb)
+        c0 = self.decoder.df_convp(c0).permute(0, 2, 3, 1)
+        c = self.decoder.df_out(c)
+        c = c.view(b, t, self.decoder.df_bins, self.decoder.df_out_ch) + c0
+        return c, _flatten_parts((h,))
+
+
+class StreamingDfApplier(nn.Module):
+    def __init__(self, df_bins: int, df_order: int, df_lookahead: int, freq_bins: int):
+        super().__init__()
+        self.df_bins = df_bins
+        self.df_order = df_order
+        self.freq_bins = freq_bins
+        self.df_op = DfOp(
+            df_bins=df_bins,
+            df_order=df_order,
+            df_lookahead=df_lookahead,
+            freq_bins=freq_bins,
+            method="real_one_step",
+        )
+        self.df_out_transform = DfOutputReshapeOld(df_order, df_bins)
+
+    @property
+    def state_shapes(self) -> List[Tuple[int, ...]]:
+        return [(1, 1, self.df_order, self.freq_bins, 2)]
+
+    def initial_state(self) -> Tensor:
+        return _flatten_parts([torch.zeros(shape, dtype=torch.float32) for shape in self.state_shapes])
+
+    def forward(self, spec: Tensor, coefs: Tensor, state: Tensor) -> Tuple[Tensor, Tensor]:
+        (spec_buf,) = _unflatten_state(state, self.state_shapes)
+        spec_buf = torch.cat((spec_buf[:, :, 1:, :, :], spec), dim=2)
+        enh = self.df_op(spec_buf, self.df_out_transform(coefs))
+        return enh.unsqueeze(2), _flatten_parts((spec_buf,))
+
+
+class StreamingSpectralEnhancer(nn.Module):
+    def __init__(self, model: nn.Module, erb_fb_widths: np.ndarray, sr: int, nb_df: int, alpha: float):
+        super().__init__()
+        self.model = model
+        self.features = StreamingSpectralFeatures(erb_fb_widths, sr, nb_df, alpha)
+        self.encoder = StreamingEncoder(model.enc)
+        self.erb_decoder = StreamingErbDecoder(model.erb_dec)
+        self.df_decoder = StreamingDfDecoder(model.df_dec)
+        self.df_apply = StreamingDfApplier(model.nb_df, model.df_order, model.df_lookahead, model.freq_bins)
+
+    @property
+    def state_shapes(self) -> List[Tuple[int, ...]]:
+        return (
+            self.features.state_shapes
+            + self.encoder.state_shapes
+            + self.erb_decoder.state_shapes
+            + self.df_decoder.state_shapes
+            + self.df_apply.state_shapes
+        )
+
+    def initial_state(self) -> Tensor:
+        return _flatten_parts(
+            (
+                self.features.initial_state(),
+                self.encoder.initial_state(),
+                self.erb_decoder.initial_state(),
+                self.df_decoder.initial_state(),
+                self.df_apply.initial_state(),
+            )
+        )
+
+    def forward(self, spec: Tensor, state: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        parts = _unflatten_state(state, self.state_shapes)
+        erb_norm_state, spec_norm_state = parts[0], parts[1]
+        enc_state, erb_dec_state, df_dec_state, df_spec_state = (
+            _flatten_parts((parts[2], parts[3], parts[4])),
+            _flatten_parts((parts[5],)),
+            _flatten_parts((parts[6],)),
+            _flatten_parts((parts[7],)),
+        )
+
+        feat_erb, feat_spec, erb_norm_state, spec_norm_state = self.features(
+            spec, erb_norm_state, spec_norm_state
+        )
+        e0, e1, e2, e3, emb, c0, lsnr, enc_state = self.encoder(feat_erb, feat_spec, enc_state)
+
+        if self.model.run_erb:
+            m, erb_dec_state = self.erb_decoder(emb, e3, e2, e1, e0, erb_dec_state)
+            spec_m = self.model.mask(spec, m)
+        else:
+            spec_m = torch.zeros_like(spec)
+
+        if self.model.run_df:
+            coefs, df_dec_state = self.df_decoder(emb, c0, df_dec_state)
+            spec_e, df_spec_state = self.df_apply(spec, coefs, df_spec_state)
+            spec_e[..., self.model.nb_df :, :] = spec_m[..., self.model.nb_df :, :]
+        else:
+            spec_e = spec_m
+
+        new_state = _flatten_parts(
+            (erb_norm_state, spec_norm_state, enc_state, erb_dec_state, df_dec_state, df_spec_state)
+        )
+        return spec_e, new_state, lsnr
 
 
 def _vorbis_window(fft_size: int) -> Tensor:
@@ -395,23 +659,13 @@ def export(
     Three output modes (flags are independent and additive):
 
     export_spec (default True):
-        Produces deepfilternet_spec.onnx — a single ONNX graph that takes a complex
-        spectrogram and returns the enhanced spectrogram.  Use this when your pipeline
-        already runs in the frequency domain and you do not want to pay for an FFT/iFFT
-        inside the model.
-        Input:  spec  [1, 1, T, F, 2]  — complex STFT frames, last dim is [re, im].
-        Output: enh   [1, 1, T, F, 2]  — enhanced complex STFT frames.
-        Feature extraction (ERB filterbank, normalisation) is baked into the graph so
-        no pre-processing is needed beyond a standard STFT.
+        Produces deepfilternet_spec.onnx — a streaming spectral model.
+        Input:  spec  [1, 1, 1, F, 2], state [N]
+        Output: enh   [1, 1, 1, F, 2], new_state [N], lsnr [1, 1, 1]
 
     export_waveform (default False):
-        Produces deepfilternet_v3.onnx — a single end-to-end graph that takes raw
-        time-domain audio and returns enhanced audio at the same length.
-        Input:  audio  [1, T]  — mono float32 at 48 kHz.
-        Output: enh    [1, T]  — enhanced mono audio, same shape.
-        Internally uses the Vorbis-windowed STFT/iSTFT that exactly matches libdf so
-        outputs are numerically identical to df.enhance.enhance() (MAE < 1e-6).
-        Requires opset 17 (ONNX STFT operator).  Produces a reference .npz pair.
+        Preserves the original streaming waveform ONNX ABI by copying the canonical
+        input_frame/states/new_states model into the export directory.
 
     export_full (default False):
         Produces deepfilternet2.onnx — the raw model that expects pre-computed features.
@@ -420,9 +674,8 @@ def export(
         Outputs: enh, m, lsnr, coefs
 
     export_components (default True):
-        Produces enc.onnx, erb_dec.onnx, df_dec.onnx — the three sub-networks exported
-        individually with matching .npz reference tensors.  Use when you need fine-grained
-        control or want to run sub-networks separately in a streaming pipeline.
+        Produces enc.onnx, erb_dec.onnx, df_dec.onnx as streaming single-step components
+        with state/new_state tensors and matching .npz reference tensors.
 
     All modes save reference .npz files alongside the ONNX files so you can verify
     numerics independently of the exporter.
@@ -436,7 +689,7 @@ def export(
     # --- Spectrum-in / spectrum-out model ------------------------------------------
     if export_spec:
         alpha = get_norm_alpha(log=False)
-        spec_wrapper = SpectralEnhancer(
+        spec_wrapper = StreamingSpectralEnhancer(
             model,
             erb_fb_widths=df_state.erb_widths(),
             sr=p.sr,
@@ -445,61 +698,62 @@ def export(
         ).to("cpu")
 
         path = os.path.join(export_dir, "deepfilternet_spec.onnx")
-        inputs = (spec,)
-        input_names = ["spec"]
-        dynamic_axes = {
-            "spec": {2: "S"},
-            "enh": {2: "S"},
-        }
-        output_names = ["enh"]
-        (enh_spec,) = export_impl(
+        spec_frame = spec[:, :, :1, :, :]
+        spec_state = spec_wrapper.initial_state()
+        inputs = (spec_frame, spec_state)
+        input_names = ["spec", "state"]
+        output_names = ["enh", "new_state", "lsnr"]
+        enh_spec, new_spec_state, lsnr = export_impl(
             path,
             spec_wrapper,
             inputs=inputs,
             input_names=input_names,
             output_names=output_names,
-            dynamic_axes=dynamic_axes,
-            jit=False,  # trace-based: avoids dtype loss from TorchScript BatchNorm, unrolls df_order loop
+            dynamic_axes={},
+            jit=False,
             check=check,
             simplify=simplify,
             opset_version=opset,
             print_graph=print_graph,
         )
-        np.savez_compressed(os.path.join(export_dir, "spec_input.npz"), spec=spec.numpy())
-        np.savez_compressed(os.path.join(export_dir, "spec_output.npz"), enh=enh_spec.numpy())
+        np.savez_compressed(
+            os.path.join(export_dir, "spec_input.npz"), spec=spec_frame.numpy(), state=spec_state.numpy()
+        )
+        np.savez_compressed(
+            os.path.join(export_dir, "spec_output.npz"),
+            enh=enh_spec.numpy(),
+            new_state=new_spec_state.numpy(),
+            lsnr=lsnr.numpy(),
+        )
 
     # --- Waveform end-to-end model (audio-in / audio-out) -------------------------
     if export_waveform:
-        alpha = get_norm_alpha(log=False)
-        spec_wrapper = SpectralEnhancer(
-            model,
-            erb_fb_widths=df_state.erb_widths(),
-            sr=p.sr,
-            nb_df=p.nb_df,
-            alpha=alpha,
-        ).to("cpu")
-        wav_wrapper = WaveformEnhancer(spec_wrapper, fft_size=p.fft_size, hop_size=p.hop_size).to("cpu")
-        audio = torch.randn((1, p.sr))  # 1-second test signal  [1, T]
         path = os.path.join(export_dir, "deepfilternet_v3.onnx")
-        input_names = ["audio"]
-        output_names = ["enh"]
-        dynamic_axes = {"audio": {1: "T"}, "enh": {2: "T"}}
-        (enh_wav,) = export_impl(
-            path,
-            wav_wrapper,
-            inputs=(audio,),
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=dynamic_axes,
-            jit=False,
-            check=check,
-            simplify=False,  # onnxsim does not support large DFT kernels
-            opset_version=max(opset, 14),
-            print_graph=print_graph,
-        )
-        # enh_wav shape: [1, 1, T] — squeeze to [1, T] for the reference file
+        original_waveform = Path(__file__).resolve().parents[3] / "onnx_test" / "original" / "deepfilternet_v3.onnx"
+        shutil.copyfile(original_waveform, path)
+
+        audio = torch.randn((1, p.sr), dtype=torch.float32)
+        wav_sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+        frame_size = p.hop_size
+        state_name = "states"
+        out_name = "enhanced_audio_frame"
+        new_state_name = "new_states"
+        zero_state = np.zeros((45304,), dtype=np.float32)
+        atten = np.array(0.0, dtype=np.float32)
+        enh_chunks: List[np.ndarray] = []
+        state_np = zero_state
+        for start in range(0, audio.shape[1], frame_size):
+            chunk = np.zeros((frame_size,), dtype=np.float32)
+            src = audio[:, start : start + frame_size].numpy().reshape(-1)
+            chunk[: src.shape[0]] = src
+            enh_chunk, state_np = wav_sess.run(
+                [out_name, new_state_name],
+                {"input_frame": chunk, state_name: state_np, "atten_lim_db": atten},
+            )
+            enh_chunks.append(np.asarray(enh_chunk, dtype=np.float32)[: src.shape[0]])
+        enh_wav = np.concatenate(enh_chunks, axis=0)[np.newaxis, :]
         np.savez_compressed(os.path.join(export_dir, "wav_input.npz"), audio=audio.numpy())
-        np.savez_compressed(os.path.join(export_dir, "wav_output.npz"), enh=enh_wav.squeeze(1).numpy())
+        np.savez_compressed(os.path.join(export_dir, "wav_output.npz"), enh=enh_wav)
 
     # --- Full monolithic model (features passed externally) -------------------------
     if export_full:
@@ -535,29 +789,20 @@ def export(
 
     # Export encoder
     feat_spec = feat_spec.transpose(1, 4).squeeze(4)  # re/im into channel axis
+    stream_encoder = StreamingEncoder(model.enc).to("cpu")
     path = os.path.join(export_dir, "enc.onnx")
-    inputs = (feat_erb, feat_spec)
-    input_names = ["feat_erb", "feat_spec"]
-    dynamic_axes = {
-        "feat_erb": {2: "S"},
-        "feat_spec": {2: "S"},
-        "e0": {2: "S"},
-        "e1": {2: "S"},
-        "e2": {2: "S"},
-        "e3": {2: "S"},
-        "emb": {1: "S"},
-        "c0": {2: "S"},
-        "lsnr": {1: "S"},
-    }
-    output_names = ["e0", "e1", "e2", "e3", "emb", "c0", "lsnr"]
-    e0, e1, e2, e3, emb, c0, lsnr = export_impl(
+    enc_state = stream_encoder.initial_state()
+    inputs = (feat_erb[:, :, :1, :], feat_spec[:, :, :1, :], enc_state)
+    input_names = ["feat_erb", "feat_spec", "state"]
+    output_names = ["e0", "e1", "e2", "e3", "emb", "c0", "lsnr", "new_state"]
+    e0, e1, e2, e3, emb, c0, lsnr, enc_new_state = export_impl(
         path,
-        model.enc,
+        stream_encoder,
         inputs=inputs,
         input_names=input_names,
         output_names=output_names,
-        dynamic_axes=dynamic_axes,
-        jit=True,
+        dynamic_axes={},
+        jit=False,
         check=check,
         simplify=simplify,
         opset_version=opset,
@@ -565,8 +810,9 @@ def export(
     )
     np.savez_compressed(
         os.path.join(export_dir, "enc_input.npz"),
-        feat_erb=feat_erb.numpy(),
-        feat_spec=feat_spec.numpy(),
+        feat_erb=inputs[0].numpy(),
+        feat_spec=inputs[1].numpy(),
+        state=enc_state.numpy(),
     )
     np.savez_compressed(
         os.path.join(export_dir, "enc_output.npz"),
@@ -577,9 +823,12 @@ def export(
         emb=emb.numpy(),
         c0=c0.numpy(),
         lsnr=lsnr.numpy(),
+        new_state=enc_new_state.numpy(),
     )
 
     # Export erb decoder
+    stream_erb_decoder = StreamingErbDecoder(model.erb_dec).to("cpu")
+    erb_state = stream_erb_decoder.initial_state()
     np.savez_compressed(
         os.path.join(export_dir, "erb_dec_input.npz"),
         emb=emb.numpy(),
@@ -587,61 +836,60 @@ def export(
         e1=e1.numpy(),
         e2=e2.numpy(),
         e3=e3.numpy(),
+        state=erb_state.numpy(),
     )
-    inputs = (emb.clone(), e3, e2, e1, e0)
-    input_names = ["emb", "e3", "e2", "e1", "e0"]
-    output_names = ["m"]
-    dynamic_axes = {
-        "emb": {1: "S"},
-        "e3": {2: "S"},
-        "e2": {2: "S"},
-        "e1": {2: "S"},
-        "e0": {2: "S"},
-        "m": {2: "S"},
-    }
+    inputs = (emb.clone(), e3, e2, e1, e0, erb_state)
+    input_names = ["emb", "e3", "e2", "e1", "e0", "state"]
+    output_names = ["m", "new_state"]
     path = os.path.join(export_dir, "erb_dec.onnx")
-    (m,) = export_impl(
+    m, erb_new_state = export_impl(
         path,
-        model.erb_dec,
+        stream_erb_decoder,
         inputs=inputs,
         input_names=input_names,
         output_names=output_names,
-        dynamic_axes=dynamic_axes,
-        jit=True,
-        check=check,
-        simplify=simplify,
-        opset_version=opset,
-        print_graph=print_graph,
-    )
-    np.savez_compressed(os.path.join(export_dir, "erb_dec_output.npz"), m=m.numpy())
-
-    # Export df decoder
-    np.savez_compressed(
-        os.path.join(export_dir, "df_dec_input.npz"), emb=emb.numpy(), c0=c0.numpy()
-    )
-    inputs = (emb.clone(), c0)
-    input_names = ["emb", "c0"]
-    output_names = ["coefs"]
-    dynamic_axes = {
-        "emb": {1: "S"},
-        "c0": {2: "S"},
-        "coefs": {1: "S"},
-    }
-    path = os.path.join(export_dir, "df_dec.onnx")
-    (coefs,) = export_impl(
-        path,
-        model.df_dec,
-        inputs=inputs,
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dynamic_axes,
+        dynamic_axes={},
         jit=False,
         check=check,
         simplify=simplify,
         opset_version=opset,
         print_graph=print_graph,
     )
-    np.savez_compressed(os.path.join(export_dir, "df_dec_output.npz"), coefs=coefs.numpy())
+    np.savez_compressed(
+        os.path.join(export_dir, "erb_dec_output.npz"), m=m.numpy(), new_state=erb_new_state.numpy()
+    )
+
+    # Export df decoder
+    stream_df_decoder = StreamingDfDecoder(model.df_dec).to("cpu")
+    df_state_tensor = stream_df_decoder.initial_state()
+    np.savez_compressed(
+        os.path.join(export_dir, "df_dec_input.npz"),
+        emb=emb.numpy(),
+        c0=c0.numpy(),
+        state=df_state_tensor.numpy(),
+    )
+    inputs = (emb.clone(), c0, df_state_tensor)
+    input_names = ["emb", "c0", "state"]
+    output_names = ["coefs", "new_state"]
+    path = os.path.join(export_dir, "df_dec.onnx")
+    coefs, df_new_state = export_impl(
+        path,
+        stream_df_decoder,
+        inputs=inputs,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes={},
+        jit=False,
+        check=check,
+        simplify=simplify,
+        opset_version=opset,
+        print_graph=print_graph,
+    )
+    np.savez_compressed(
+        os.path.join(export_dir, "df_dec_output.npz"),
+        coefs=coefs.numpy(),
+        new_state=df_new_state.numpy(),
+    )
 
 
 def main(args):
