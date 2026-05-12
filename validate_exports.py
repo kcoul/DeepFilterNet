@@ -1,10 +1,10 @@
 """
-Validate the streaming DeepFilterNet ONNX exports against the reference Torch pipeline.
+Validate the DeepFilterNet ONNX exports against the reference Torch pipeline.
 
 Checks:
-1. Waveform export preserves the original streaming ABI and matches the checked-in source model.
-2. Streaming spectral export rolled frame-by-frame matches the batch spectral Torch wrapper.
-3. Streaming component exports rolled frame-by-frame match the batch encoder / decoder modules.
+1. Waveform export preserves the original stateful ABI and matches the checked-in source model.
+2. Spectral export rolled frame-by-frame matches the batch spectral Torch wrapper.
+3. Component exports rolled frame-by-frame match the batch encoder / decoder modules.
 """
 
 import os
@@ -139,7 +139,7 @@ print(f"  Epoch {epoch}")
 
 p = ModelParams()
 
-# Build the streaming spectral wrapper to get the correct non-zero initial state.
+# Build the spectral wrapper to get the correct non-zero initial state.
 # (ERB norm init = linspace(-60,-90), spec norm init = unit_norm_init — not zeros.)
 with torch.no_grad():
     _spec_wrapper = StreamingSpectralEnhancer(
@@ -183,7 +183,7 @@ spec_np = spec_t.numpy().astype(np.float32)
 feat_erb_np = feat_erb_t.numpy().astype(np.float32)
 feat_spec_ch_np = feat_spec_ch_t.numpy().astype(np.float32)
 
-print("\n[1] Waveform streaming export")
+print("\n[1] Waveform export")
 if have_wav:
     wav_export = _sess(os.path.join(EXPORT_DIR, "deepfilternet_v3.onnx"))
     wav_original = _sess(ORIGINAL_WAV_MODEL)
@@ -194,18 +194,18 @@ else:
     print("  SKIP")
     ok1 = True
 
-print("\n[2] Spectral streaming export")
+print("\n[2] Spectral export")
 spec_export = _sess(os.path.join(EXPORT_DIR, "deepfilternet_spec.onnx"))
 ort_spec, final_spec_state, ort_lsnr = _run_spectral_stream(spec_export, spec_np, spec_initial_state)
 ok2 = _stats(
-    "streaming spectral ONNX vs batch spectral Torch",
+    "spectral ONNX vs batch spectral Torch",
     ort_spec,
     ref_spec,
     mae_threshold=5e-3,
     max_threshold=5e-2,
 )
 
-print("\n[3] Component streaming exports")
+print("\n[3] Component exports")
 enc_export = _sess(os.path.join(EXPORT_DIR, "enc.onnx"))
 erb_export = _sess(os.path.join(EXPORT_DIR, "erb_dec.onnx"))
 df_export = _sess(os.path.join(EXPORT_DIR, "df_dec.onnx"))
