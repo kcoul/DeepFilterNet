@@ -66,6 +66,59 @@ def _unflatten_state(state: Tensor, shapes: Iterable[Tuple[int, ...]]) -> List[T
     return parts
 
 
+class _StreamPad(nn.Module):
+    """Causal time pad that is fed from carried state instead of zeros.
+
+    A pad of p past frames before a time conv becomes a cache of the last p
+    input frames. The streaming wrapper loads `cache` before each call and
+    reads `new` after it.
+    """
+
+    def __init__(self, pad: nn.ConstantPad2d):
+        super().__init__()
+        self.f_left, self.f_right, self.t = pad.padding[0], pad.padding[1], pad.padding[2]
+        self.cache: Optional[Tensor] = None
+        self.new: Optional[Tensor] = None
+        self.shape: Optional[Tuple[int, ...]] = None
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.cache is None:
+            self.shape = (x.shape[0], x.shape[1], self.t, x.shape[3])
+            cache = x.new_zeros(self.shape)
+        else:
+            cache = self.cache
+        seq = torch.cat((cache, x), dim=2)
+        self.new = seq[:, :, -self.t :, :]
+        return F.pad(seq, (self.f_left, self.f_right, 0, 0))
+
+
+def _install_stream_pads(module: nn.Module) -> Tuple[nn.Module, List[_StreamPad]]:
+    """Copy `module` and swap each causal time pad for a _StreamPad."""
+    module = deepcopy(module)
+    pads: List[_StreamPad] = []
+    for parent in list(module.modules()):
+        for name, child in list(parent.named_children()):
+            if isinstance(child, nn.ConstantPad2d) and child.padding[2] > 0:
+                assert child.padding[3] == 0, "streaming export needs causal time pads"
+                sp = _StreamPad(child)
+                setattr(parent, name, sp)
+                pads.append(sp)
+    return module, pads
+
+
+def _load_pads(pads: List[_StreamPad], parts: List[Tensor]) -> None:
+    for p, c in zip(pads, parts):
+        p.cache = c
+
+
+def _probe_pads(pads: List[_StreamPad], fn, *args) -> Tuple:
+    for p in pads:
+        p.cache = None
+    with torch.no_grad():
+        out = fn(*args)
+    return out
+
+
 class ExponentialMeanNorm(nn.Module):
     """Torch implementation of the ERB mean normalization used by libdf."""
 
@@ -226,75 +279,69 @@ class StreamingEncoder(nn.Module):
     def __init__(self, encoder: nn.Module):
         super().__init__()
         p = ModelParams()
-        self.encoder = encoder
-        self.prev_erb_frames = 2
-        self.prev_spec_frames = 2
-        self.feat_erb_bins = encoder.erb_bins
-        self.feat_spec_bins = p.nb_df
+        self.encoder, self.pads = _install_stream_pads(encoder)
         self.emb_hidden_size = encoder.emb_gru.hidden_size
         self.emb_num_layers = encoder.emb_gru.gru.num_layers
+        h_shape = (self.emb_num_layers, 1, self.emb_hidden_size)
+        self.example_out = _probe_pads(
+            self.pads,
+            self._run,
+            torch.zeros(1, 1, 1, encoder.erb_bins),
+            torch.zeros(1, 2, 1, p.nb_df),
+            torch.zeros(h_shape),
+        )
+        self._h_shape = h_shape
 
     @property
     def state_shapes(self) -> List[Tuple[int, ...]]:
-        return [
-            (1, 1, self.prev_erb_frames, self.feat_erb_bins),
-            (1, 2, self.prev_spec_frames, self.feat_spec_bins),
-            (self.emb_num_layers, 1, self.emb_hidden_size),
-        ]
+        return [p.shape for p in self.pads] + [self._h_shape]
 
     def initial_state(self) -> Tensor:
         return _flatten_parts([torch.zeros(shape, dtype=torch.float32) for shape in self.state_shapes])
+
+    def _run(self, feat_erb: Tensor, feat_spec: Tensor, h: Tensor):
+        e0 = self.encoder.erb_conv0(feat_erb)
+        e1 = self.encoder.erb_conv1(e0)
+        e2 = self.encoder.erb_conv2(e1)
+        e3 = self.encoder.erb_conv3(e2)
+        c0 = self.encoder.df_conv0(feat_spec)
+        c1 = self.encoder.df_conv1(c0)
+        cemb = c1.permute(0, 2, 3, 1).flatten(2)
+        cemb = self.encoder.df_fc_emb(cemb)
+        emb = e3.permute(0, 2, 3, 1).flatten(2)
+        emb = self.encoder.combine(emb, cemb)
+        emb, h = self.encoder.emb_gru(emb, h)
+        lsnr = self.encoder.lsnr_fc(emb) * self.encoder.lsnr_scale + self.encoder.lsnr_offset
+        return e0, e1, e2, e3, emb, c0, lsnr, h
 
     def forward(
         self, feat_erb: Tensor, feat_spec: Tensor, state: Tensor
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        prev_erb, prev_spec, h = _unflatten_state(state, self.state_shapes)
-
-        feat_erb_seq = torch.cat((prev_erb, feat_erb), dim=2)
-        feat_spec_seq = torch.cat((prev_spec, feat_spec), dim=2)
-
-        e0 = self.encoder.erb_conv0(feat_erb_seq)
-        e1 = self.encoder.erb_conv1(e0)
-        e2 = self.encoder.erb_conv2(e1)
-        e3 = self.encoder.erb_conv3(e2)
-        c0 = self.encoder.df_conv0(feat_spec_seq)
-        c1 = self.encoder.df_conv1(c0)
-        cemb = c1[:, :, -1:, :].permute(0, 2, 3, 1).flatten(2)
-        cemb = self.encoder.df_fc_emb(cemb)
-        emb = e3[:, :, -1:, :].permute(0, 2, 3, 1).flatten(2)
-        emb = self.encoder.combine(emb, cemb)
-        emb, h = self.encoder.emb_gru(emb, h)
-        lsnr = self.encoder.lsnr_fc(emb) * self.encoder.lsnr_scale + self.encoder.lsnr_offset
-
-        new_state = _flatten_parts((feat_erb_seq[:, :, 1:, :], feat_spec_seq[:, :, 1:, :], h))
-        return (
-            e0[:, :, -1:, :],
-            e1[:, :, -1:, :],
-            e2[:, :, -1:, :],
-            e3[:, :, -1:, :],
-            emb[:, -1:, :],
-            c0[:, :, -1:, :],
-            lsnr[:, -1:, :],
-            new_state,
-        )
+        parts = _unflatten_state(state, self.state_shapes)
+        _load_pads(self.pads, parts[:-1])
+        e0, e1, e2, e3, emb, c0, lsnr, h = self._run(feat_erb, feat_spec, parts[-1])
+        new_state = _flatten_parts([p.new for p in self.pads] + [h])
+        return e0, e1, e2, e3, emb, c0, lsnr, new_state
 
 
 class StreamingErbDecoder(nn.Module):
-    def __init__(self, decoder: nn.Module):
+    def __init__(self, decoder: nn.Module, enc_example: Tuple):
         super().__init__()
-        self.decoder = decoder
+        self.decoder, self.pads = _install_stream_pads(decoder)
         self.hidden_size = decoder.emb_gru.hidden_size
         self.num_layers = decoder.emb_gru.gru.num_layers
+        self._h_shape = (self.num_layers, 1, self.hidden_size)
+        e0, e1, e2, e3, emb = enc_example[:5]
+        _probe_pads(self.pads, self._run, emb, e3, e2, e1, e0, torch.zeros(self._h_shape))
 
     @property
     def state_shapes(self) -> List[Tuple[int, ...]]:
-        return [(self.num_layers, 1, self.hidden_size)]
+        return [p.shape for p in self.pads] + [self._h_shape]
 
     def initial_state(self) -> Tensor:
         return _flatten_parts([torch.zeros(shape, dtype=torch.float32) for shape in self.state_shapes])
 
-    def forward(self, emb: Tensor, e3: Tensor, e2: Tensor, e1: Tensor, e0: Tensor, state: Tensor) -> Tuple[Tensor, Tensor]:
-        (h,) = _unflatten_state(state, self.state_shapes)
+    def _run(self, emb: Tensor, e3: Tensor, e2: Tensor, e1: Tensor, e0: Tensor, h: Tensor):
         b, _, t, f8 = e3.shape
         emb, h = self.decoder.emb_gru(emb, h)
         emb = emb.view(b, t, f8, -1).permute(0, 3, 1, 2)
@@ -302,25 +349,33 @@ class StreamingErbDecoder(nn.Module):
         e2 = self.decoder.convt2(self.decoder.conv2p(e2) + e3)
         e1 = self.decoder.convt1(self.decoder.conv1p(e1) + e2)
         m = self.decoder.conv0_out(self.decoder.conv0p(e0) + e1)
-        return m, _flatten_parts((h,))
+        return m, h
+
+    def forward(self, emb: Tensor, e3: Tensor, e2: Tensor, e1: Tensor, e0: Tensor, state: Tensor) -> Tuple[Tensor, Tensor]:
+        parts = _unflatten_state(state, self.state_shapes)
+        _load_pads(self.pads, parts[:-1])
+        m, h = self._run(emb, e3, e2, e1, e0, parts[-1])
+        return m, _flatten_parts([p.new for p in self.pads] + [h])
 
 
 class StreamingDfDecoder(nn.Module):
-    def __init__(self, decoder: nn.Module):
+    def __init__(self, decoder: nn.Module, enc_example: Tuple):
         super().__init__()
-        self.decoder = decoder
+        self.decoder, self.pads = _install_stream_pads(decoder)
         self.hidden_size = decoder.df_gru.hidden_size
         self.num_layers = decoder.df_gru.gru.num_layers
+        self._h_shape = (self.num_layers, 1, self.hidden_size)
+        emb, c0 = enc_example[4], enc_example[5]
+        _probe_pads(self.pads, self._run, emb, c0, torch.zeros(self._h_shape))
 
     @property
     def state_shapes(self) -> List[Tuple[int, ...]]:
-        return [(self.num_layers, 1, self.hidden_size)]
+        return [p.shape for p in self.pads] + [self._h_shape]
 
     def initial_state(self) -> Tensor:
         return _flatten_parts([torch.zeros(shape, dtype=torch.float32) for shape in self.state_shapes])
 
-    def forward(self, emb: Tensor, c0: Tensor, state: Tensor) -> Tuple[Tensor, Tensor]:
-        (h,) = _unflatten_state(state, self.state_shapes)
+    def _run(self, emb: Tensor, c0: Tensor, h: Tensor):
         b, t, _ = emb.shape
         c, h = self.decoder.df_gru(emb, h)
         if self.decoder.df_skip is not None:
@@ -328,7 +383,13 @@ class StreamingDfDecoder(nn.Module):
         c0 = self.decoder.df_convp(c0).permute(0, 2, 3, 1)
         c = self.decoder.df_out(c)
         c = c.view(b, t, self.decoder.df_bins, self.decoder.df_out_ch) + c0
-        return c, _flatten_parts((h,))
+        return c, h
+
+    def forward(self, emb: Tensor, c0: Tensor, state: Tensor) -> Tuple[Tensor, Tensor]:
+        parts = _unflatten_state(state, self.state_shapes)
+        _load_pads(self.pads, parts[:-1])
+        c, h = self._run(emb, c0, parts[-1])
+        return c, _flatten_parts([p.new for p in self.pads] + [h])
 
 
 class StreamingDfApplier(nn.Module):
@@ -366,8 +427,8 @@ class StreamingSpectralEnhancer(nn.Module):
         self.model = model
         self.features = StreamingSpectralFeatures(erb_fb_widths, sr, nb_df, alpha)
         self.encoder = StreamingEncoder(model.enc)
-        self.erb_decoder = StreamingErbDecoder(model.erb_dec)
-        self.df_decoder = StreamingDfDecoder(model.df_dec)
+        self.erb_decoder = StreamingErbDecoder(model.erb_dec, self.encoder.example_out)
+        self.df_decoder = StreamingDfDecoder(model.df_dec, self.encoder.example_out)
         self.df_apply = StreamingDfApplier(model.nb_df, model.df_order, model.df_lookahead, model.freq_bins)
 
     @property
@@ -827,7 +888,7 @@ def export(
     )
 
     # Export erb decoder
-    stream_erb_decoder = StreamingErbDecoder(model.erb_dec).to("cpu")
+    stream_erb_decoder = StreamingErbDecoder(model.erb_dec, stream_encoder.example_out).to("cpu")
     erb_state = stream_erb_decoder.initial_state()
     np.savez_compressed(
         os.path.join(export_dir, "erb_dec_input.npz"),
@@ -860,7 +921,7 @@ def export(
     )
 
     # Export df decoder
-    stream_df_decoder = StreamingDfDecoder(model.df_dec).to("cpu")
+    stream_df_decoder = StreamingDfDecoder(model.df_dec, stream_encoder.example_out).to("cpu")
     df_state_tensor = stream_df_decoder.initial_state()
     np.savez_compressed(
         os.path.join(export_dir, "df_dec_input.npz"),
